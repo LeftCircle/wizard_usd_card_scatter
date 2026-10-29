@@ -1,0 +1,14 @@
+#usda 1.0
+(
+    metersPerUnit = 0.01
+    subLayers = [
+        @./geo.usda@
+    ]
+    upAxis = "Y"
+)
+
+over "Tree1"
+{
+    uniform token purpose = "proxy"
+}
+

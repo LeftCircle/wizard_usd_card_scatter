@@ -1,0 +1,26 @@
+#usda 1.0
+(
+    metersPerUnit = 0.01
+    subLayers = [
+        @./geo.usda@
+    ]
+    upAxis = "Y"
+)
+
+over "Tree1"
+{
+    uniform token purpose = "proxy"
+
+    over "polySurface6"
+    {
+        float3[] extent = [(-2211.5225, 1199.5167, -538.85754), (-1044.052, 1996.5792, 700.02014)]
+        custom bool ScatterGeo = 1
+    }
+
+    over "polySurface8"
+    {
+        float3[] extent = [(-2322.0137, 1046.3599, -16.625746), (-1492, 1644.1926, 965.2698)]
+        custom bool ScatterGeo = 1
+    }
+}
+
