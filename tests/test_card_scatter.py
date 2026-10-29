@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdShade
-from card_scatter import scatter, shade_factors
+from card_scatter import scatter, shade_factors, camera_position, camera_orientations
 
 
 class ScatterTests(unittest.TestCase):
@@ -124,6 +124,70 @@ class ScatterTests(unittest.TestCase):
             scatter(self.geo, self.render, 50, 4, 2, 0.5, 1.0,
                     '/Looks/CardMaterial', Usd.TimeCode.Default(), 10000, 1.1)
         self.assertEqual(before, self.render.read_bytes())
+
+    def test_camera_facing_random_roll_and_retained_scales(self):
+        camera_file = self.root / 'camera.usda'
+        camera_stage = Usd.Stage.CreateNew(str(camera_file))
+        parent = UsdGeom.Xform.Define(camera_stage, '/Rig')
+        parent.AddTranslateOp().Set(Gf.Vec3d(4, 7, 10))
+        camera = UsdGeom.Camera.Define(camera_stage, '/Rig/Camera')
+        camera.AddTranslateOp().Set(Gf.Vec3d(9, 13, 25))
+        camera_stage.GetRootLayer().Save()
+        self.run_scatter()
+        stage = Usd.Stage.Open(str(self.render))
+        inst = UsdGeom.PointInstancer.Get(stage, '/ScatterCards')
+        positions, scales = list(inst.GetPositionsAttr().Get()), list(inst.GetScalesAttr().Get())
+        del stage, inst
+        scatter(self.geo, self.render, 50, 4, 2, .5, 1, '/Looks/CardMaterial',
+                Usd.TimeCode.Default(), 10000, camera_file=camera_file)
+        stage = Usd.Stage.Open(str(self.render))
+        stage.Reload()
+        inst = UsdGeom.PointInstancer.Get(stage, '/ScatterCards')
+        self.assertEqual(positions, list(inst.GetPositionsAttr().Get()))
+        self.assertEqual(scales, list(inst.GetScalesAttr().Get()))
+        camera_world = Gf.Vec3d(13, 20, 35)
+        ups = []
+        for point, orientation in zip(positions, inst.GetOrientationsAttr().Get()):
+            rotation = Gf.Rotation(Gf.Quatd(orientation))
+            normal = rotation.TransformDir(Gf.Vec3d(0, 0, 1)).GetNormalized()
+            expected = (camera_world - Gf.Vec3d(point)).GetNormalized()
+            self.assertGreater(Gf.Dot(normal, expected), .99999)
+            ups.append(rotation.TransformDir(Gf.Vec3d(0, 1, 0)))
+        self.assertLess(Gf.Dot(ups[0], ups[1]), .99)
+        with self.assertRaisesRegex(ValueError, 'coincides'):
+            camera_orientations([camera_world], camera_world, [0.5])
+
+    def test_camera_selection_time_and_validation(self):
+        camera_file = self.root / 'camera.usda'
+        stage = Usd.Stage.CreateNew(str(camera_file))
+        first = UsdGeom.Camera.Define(stage, '/First')
+        first.AddTranslateOp().Set(Gf.Vec3d(1, 2, 3), Usd.TimeCode(10))
+        UsdGeom.Camera.Define(stage, '/Second')
+        stage.GetRootLayer().Save()
+        geometry = Usd.Stage.Open(str(self.geo))
+        with self.assertRaisesRegex(ValueError, '2 cameras'):
+            camera_position(camera_file, None, Usd.TimeCode(10), geometry)
+        self.assertEqual(camera_position(camera_file, '/First', Usd.TimeCode(10), geometry), Gf.Vec3d(1, 2, 3))
+        with self.assertRaisesRegex(ValueError, 'camera prim not found'):
+            camera_position(camera_file, '/Missing', Usd.TimeCode(10), geometry)
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        stage.GetRootLayer().Save()
+        with self.assertRaisesRegex(ValueError, 'same up axis'):
+            camera_position(camera_file, '/First', Usd.TimeCode(10), geometry)
+
+    def test_opacity_mask_survives_shaded_material_references(self):
+        shutil.copy(Path(__file__).resolve().parents[1] / 'materials.usda', self.root)
+        scatter(self.geo, self.render, 10, 4, 2, .5, 1, '/Looks/CardMaterial',
+                Usd.TimeCode.Default(), 10000, center_darken=.5)
+        stage = Usd.Stage.Open(str(self.render))
+        inst = UsdGeom.PointInstancer.Get(stage, '/ScatterCards')
+        for path in inst.GetPrototypesRel().GetTargets():
+            material, _ = UsdShade.MaterialBindingAPI(stage.GetPrimAtPath(path)).ComputeBoundMaterial()
+            shader = UsdShade.Shader.Get(stage, material.GetPath().AppendChild('PreviewSurface'))
+            self.assertGreater(shader.GetInput('opacityThreshold').Get(), 0)
+            src, name, _ = shader.GetInput('opacity').GetConnectedSource()
+            self.assertEqual(name, 'a')
+            self.assertEqual(src.GetPrim().GetPath(), material.GetPath().AppendChild('BrushTexture'))
 
 
 if __name__ == '__main__':

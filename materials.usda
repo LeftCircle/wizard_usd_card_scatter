@@ -34,6 +34,7 @@ def Scope "Looks"
             uniform token info:id = "UsdPreviewSurface"
             color3f inputs:diffuseColor.connect = </Looks/CardMaterial/BrushTexture.outputs:rgb>
             float inputs:opacity.connect = </Looks/CardMaterial/BrushTexture.outputs:a>
+            float inputs:opacityThreshold = 0.001
             float inputs:roughness = 1
             token outputs:surface
         }

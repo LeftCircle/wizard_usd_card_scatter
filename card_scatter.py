@@ -96,9 +96,54 @@ def shade_factors(points, vertices, center_strength, height_strength, up_axis):
     return (1 - center_strength * (1 - distance)) * (1 - height_strength * (1 - height))
 
 
+def camera_position(camera_file, camera_prim, time, geometry_stage):
+    path = Path(camera_file).resolve()
+    if not path.is_file():
+        raise ValueError(f'camera file does not exist: {path}')
+    stage = Usd.Stage.Open(str(path))
+    if not stage:
+        raise ValueError(f'cannot open camera stage: {path}')
+    if (UsdGeom.GetStageUpAxis(stage) != UsdGeom.GetStageUpAxis(geometry_stage) or
+            not math.isclose(UsdGeom.GetStageMetersPerUnit(stage), UsdGeom.GetStageMetersPerUnit(geometry_stage), rel_tol=1e-9)):
+        raise ValueError('camera and geometry stages must use the same up axis and metersPerUnit')
+    if camera_prim:
+        if (not Sdf.Path.IsValidPathString(camera_prim) or
+                not Sdf.Path(camera_prim).IsAbsolutePath() or not Sdf.Path(camera_prim).IsPrimPath()):
+            raise ValueError('--camera-prim must be an absolute USD prim path')
+        prim = stage.GetPrimAtPath(camera_prim)
+        if not prim or not prim.IsA(UsdGeom.Camera):
+            raise ValueError(f'camera prim not found: {camera_prim}')
+    else:
+        cameras = [p for p in stage.Traverse() if p.IsA(UsdGeom.Camera)]
+        if len(cameras) != 1:
+            raise ValueError(f'camera stage contains {len(cameras)} cameras; specify --camera-prim when it has more than one')
+        prim = cameras[0]
+    transform = UsdGeom.XformCache(time).GetLocalToWorldTransform(prim)
+    position = transform.Transform(Gf.Vec3d(0, 0, 0))
+    if not all(math.isfinite(x) for x in position):
+        raise ValueError('camera position must be finite')
+    print(f'Camera {prim.GetPath()} at {position}')
+    return position
+
+
+def camera_orientations(positions, camera, rolls):
+    """Point the local +Z normal at the camera and roll around that normal."""
+    rotations = []
+    for point, roll in zip(positions, rolls):
+        direction = Gf.Vec3d(camera) - Gf.Vec3d(point)
+        if direction.GetLength() < 1e-10:
+            raise ValueError('camera coincides with a scatter point; move the camera')
+        direction.Normalize()
+        face = Gf.Rotation(Gf.Vec3d(0, 0, 1), direction).GetQuat()
+        spin = Gf.Rotation(Gf.Vec3d(0, 0, 1), float(roll) * 360).GetQuat()
+        result = face * spin
+        rotations.append(Gf.Quath(float(result.GetReal()), Gf.Vec3h(*result.GetImaginary())))
+    return rotations
+
+
 def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
             material_path, time, max_attempts, center_darken=0.0, height_darken=0.0,
-            materials_path=None, shade_levels=32):
+            materials_path=None, shade_levels=32, camera_file=None, camera_prim=None):
     geo_path, render_path = Path(geo_path).resolve(), Path(render_path).resolve()
     if geo_path == render_path:
         raise ValueError("geometry input and render output must be different files")
@@ -111,6 +156,9 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
     stage = Usd.Stage.Open(str(geo_path))
     if not stage:
         raise ValueError(f"cannot open geometry stage: {geo_path}")
+    if camera_prim and not camera_file:
+        raise ValueError('--camera-prim requires --camera')
+    camera = camera_position(camera_file, camera_prim, time, stage) if camera_file else None
     meshes = [UsdGeom.Mesh(p) for p in stage.Traverse() if p.IsA(UsdGeom.Mesh)
               and p.GetAttribute('ScatterGeo') and p.GetAttribute('ScatterGeo').Get(time) is True]
     if not meshes:
@@ -145,13 +193,16 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
             vertices = [transform.Transform(Gf.Vec3d(*p)) for p in mesh.GetPointsAttr().Get(time)]
             shade_values.extend(shade_factors(world, vertices, center_darken, height_darken, up_axis))
         print(f"{mesh.GetPath()}: {len(local)} points")
-    # Random uniform 3D rotations, so cards are not all facing the same direction.
+    # Draw the same random numbers in both modes so the seed keeps scales stable.
     u = rng.random((len(positions), 3))
-    qx = np.sqrt(1-u[:, 0]) * np.sin(2*math.pi*u[:, 1])
-    qy = np.sqrt(1-u[:, 0]) * np.cos(2*math.pi*u[:, 1])
-    qz = np.sqrt(u[:, 0]) * np.sin(2*math.pi*u[:, 2])
-    qw = np.sqrt(u[:, 0]) * np.cos(2*math.pi*u[:, 2])
-    orientations = [Gf.Quath(float(w), Gf.Vec3h(float(x), float(y), float(z))) for x,y,z,w in zip(qx,qy,qz,qw)]
+    if camera is not None:
+        orientations = camera_orientations(positions, camera, u[:, 0])
+    else:
+        qx = np.sqrt(1-u[:, 0]) * np.sin(2*math.pi*u[:, 1])
+        qy = np.sqrt(1-u[:, 0]) * np.cos(2*math.pi*u[:, 1])
+        qz = np.sqrt(u[:, 0]) * np.sin(2*math.pi*u[:, 2])
+        qw = np.sqrt(u[:, 0]) * np.cos(2*math.pi*u[:, 2])
+        orientations = [Gf.Quath(float(w), Gf.Vec3h(float(x), float(y), float(z))) for x,y,z,w in zip(qx,qy,qz,qw)]
     scales = rng.uniform(min_scale, max_scale, len(positions))
 
     # Work in memory until everything is validated, then atomically replace the output.
@@ -259,13 +310,15 @@ def main():
     p.add_argument('--shade-levels', type=int, default=32, help='number of discrete shading levels, 2..256 (default: 32)')
     p.add_argument('--materials', default=None, help='material layer path for shading (default: materials.usda next to render)')
     p.add_argument('--material', default='/Looks/CardMaterial', help='absolute material prim path in composed asset')
+    p.add_argument('--camera', default=None, help='USD camera file; orient card normals toward its camera position')
+    p.add_argument('--camera-prim', default=None, help='absolute camera prim path (required if the camera file has multiple cameras)')
     p.add_argument('--time', type=float, default=None, help='sample geometry and transforms at this USD time code; default time otherwise')
     p.add_argument('--max-attempts', type=int, default=1000000, help='maximum candidate points per mesh')
     a = p.parse_args()
     try:
         scatter(a.geo, a.render, a.count, a.seed, a.size, a.min_scale, a.max_scale,
                 a.material, Usd.TimeCode.Default() if a.time is None else Usd.TimeCode(a.time), a.max_attempts,
-                a.center_darken, a.height_darken, a.materials, a.shade_levels)
+                a.center_darken, a.height_darken, a.materials, a.shade_levels, a.camera, a.camera_prim)
     except (ValueError, OSError, RuntimeError) as exc:
         p.exit(1, f'error: {exc}\n')
 
