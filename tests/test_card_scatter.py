@@ -189,6 +189,58 @@ class ScatterTests(unittest.TestCase):
             self.assertEqual(name, 'a')
             self.assertEqual(src.GetPrim().GetPath(), material.GetPath().AppendChild('BrushTexture'))
 
+    def test_random_brushes_shading_and_blended_opacity(self):
+        shutil.copy(Path(__file__).resolve().parents[1] / 'materials.usda', self.root)
+        shutil.copytree(Path(__file__).resolve().parents[1] / 'textures', self.root / 'textures')
+
+        def run(seed, opacity):
+            scatter(self.geo, self.render, 150, seed, 2, .5, 1, None,
+                    Usd.TimeCode.Default(), 10000, .8, .7, shade_levels=16, opacity=opacity)
+            stage = Usd.Stage.Open(str(self.render))
+            stage.Reload()
+            inst = UsdGeom.PointInstancer.Get(stage, '/ScatterCards')
+            records = []
+            for target in inst.GetPrototypesRel().GetTargets():
+                material, _ = UsdShade.MaterialBindingAPI(stage.GetPrimAtPath(target)).ComputeBoundMaterial()
+                texture = UsdShade.Shader.Get(stage, material.GetPath().AppendChild('BrushTexture'))
+                surface = UsdShade.Shader.Get(stage, material.GetPath().AppendChild('PreviewSurface'))
+                scale = texture.GetInput('scale').Get()
+                if opacity < 1:
+                    self.assertAlmostEqual(scale[3], opacity, places=5)
+                    self.assertEqual(surface.GetInput('opacityThreshold').Get(), 0)
+                    self.assertEqual(surface.GetInput('opacityMode').Get(), 'presence')
+                else:
+                    self.assertGreater(surface.GetInput('opacityThreshold').Get(), 0)
+                records.append((texture.GetInput('file').Get().path, scale[0]))
+            chosen = [records[i] for i in inst.GetProtoIndicesAttr().Get()]
+            return list(inst.GetPositionsAttr().Get()), list(inst.GetScalesAttr().Get()), chosen
+
+        points, scales, chosen = run(4, .8)
+        self.assertEqual(len({texture for texture, _ in chosen}), 3)
+        self.assertGreater(len({factor for _, factor in chosen}), 2)
+        same_points, same_scales, same_chosen = run(4, .8)
+        self.assertEqual((points, scales, chosen), (same_points, same_scales, same_chosen))
+        _, _, opaque = run(4, 1)
+        self.assertEqual(chosen, opaque)  # opacity does not change brush choice or color
+        _, _, different = run(7, .8)
+        self.assertNotEqual([v[0] for v in chosen], [v[0] for v in different])
+        for point, (_, factor) in zip(points, chosen):
+            expected = shade_factors([point], [(9,19,29), (11,21,31)], .8, .7, 1)[0]
+            self.assertLessEqual(abs(factor - expected), 1 / 30 + 1e-5)
+
+    def test_invalid_opacity_and_material_leave_output_untouched(self):
+        before = self.render.read_bytes()
+        for opacity in (-.1, 1.1, float('nan')):
+            with self.assertRaises(ValueError):
+                scatter(self.geo, self.render, 5, 1, 2, .5, 1, '/Looks/CardMaterial',
+                        Usd.TimeCode.Default(), 10000, opacity=opacity)
+            self.assertEqual(before, self.render.read_bytes())
+        shutil.copy(Path(__file__).resolve().parents[1] / 'materials.usda', self.root)
+        with self.assertRaisesRegex(ValueError, 'brush material not found'):
+            scatter(self.geo, self.render, 5, 1, 2, .5, 1, ['/Looks/Missing'],
+                    Usd.TimeCode.Default(), 10000, opacity=.8)
+        self.assertEqual(before, self.render.read_bytes())
+
 
 if __name__ == '__main__':
     unittest.main()

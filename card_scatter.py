@@ -141,18 +141,55 @@ def camera_orientations(positions, camera, rolls):
     return rotations
 
 
+def brush_info(stage, path):
+    """Locate a preview surface and its shared color/alpha texture."""
+    material = UsdShade.Material.Get(stage, path)
+    if not material:
+        raise ValueError(f'brush material not found: {path}')
+    surface_output = material.GetSurfaceOutput()
+    source = surface_output.GetConnectedSource() if surface_output else None
+    surface = UsdShade.Shader(source[0].GetPrim()) if source else None
+    if not surface or surface.GetIdAttr().Get() != 'UsdPreviewSurface':
+        raise ValueError(f'{path}: expected a connected UsdPreviewSurface')
+    color = surface.GetInput('diffuseColor')
+    alpha = surface.GetInput('opacity')
+    color_src = color.GetConnectedSource() if color else None
+    alpha_src = alpha.GetConnectedSource() if alpha else None
+    if not color_src or not alpha_src or color_src[0].GetPrim() != alpha_src[0].GetPrim() or color_src[1] != 'rgb' or alpha_src[1] != 'a':
+        raise ValueError(f'{path}: diffuseColor and opacity must use the rgb and a outputs of the same UsdUVTexture')
+    texture = UsdShade.Shader(color_src[0].GetPrim())
+    if not texture or texture.GetIdAttr().Get() != 'UsdUVTexture':
+        raise ValueError(f'{path}: expected a UsdUVTexture')
+    if not texture.GetPath().HasPrefix(path) or not surface.GetPath().HasPrefix(path):
+        raise ValueError(f'{path}: texture and surface shaders must be children of the material')
+    values = []
+    for name, fallback in [('scale', Gf.Vec4f(1)), ('bias', Gf.Vec4f(0))]:
+        inp = texture.GetInput(name)
+        if inp and inp.HasConnectedSource():
+            raise ValueError(f'{path}: texture inputs:{name} must not be connected')
+        value = inp.Get() if inp else None
+        values.append(value if value is not None else fallback)
+    for name in ('opacityThreshold', 'opacityMode'):
+        inp = surface.GetInput(name)
+        if inp and inp.HasConnectedSource():
+            raise ValueError(f'{path}: surface inputs:{name} must not be connected')
+    return (texture.GetPath().MakeRelativePath(path), surface.GetPath().MakeRelativePath(path), *values)
+
+
 def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
             material_path, time, max_attempts, center_darken=0.0, height_darken=0.0,
-            materials_path=None, shade_levels=32, camera_file=None, camera_prim=None):
+            materials_path=None, shade_levels=32, camera_file=None, camera_prim=None, opacity=1.0):
     geo_path, render_path = Path(geo_path).resolve(), Path(render_path).resolve()
     if geo_path == render_path:
         raise ValueError("geometry input and render output must be different files")
     if count < 1 or size <= 0 or min_scale <= 0 or max_scale < min_scale or max_attempts < count:
         raise ValueError("count, size, and scales must be positive; max scale >= min scale and max attempts >= count")
-    if not all(math.isfinite(v) for v in (size, min_scale, max_scale, center_darken, height_darken)):
-        raise ValueError("size, scales and shading strengths must be finite")
+    if not all(math.isfinite(v) for v in (size, min_scale, max_scale, center_darken, height_darken, opacity)):
+        raise ValueError("size, scales, opacity and shading strengths must be finite")
     if not 0 <= center_darken <= 1 or not 0 <= height_darken <= 1 or not 2 <= shade_levels <= 256:
         raise ValueError("shading strengths must be between 0 and 1; shade levels must be between 2 and 256")
+    if not 0 <= opacity <= 1:
+        raise ValueError('opacity must be between 0 and 1')
     stage = Usd.Stage.Open(str(geo_path))
     if not stage:
         raise ValueError(f"cannot open geometry stage: {geo_path}")
@@ -163,8 +200,6 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
               and p.GetAttribute('ScatterGeo') and p.GetAttribute('ScatterGeo').Get(time) is True]
     if not meshes:
         raise ValueError("no Mesh prims with bool ScatterGeo = true in the geometry stage")
-    if not Sdf.Path.IsValidPathString(material_path) or not Sdf.Path(material_path).IsAbsolutePath() or not Sdf.Path(material_path).IsPrimPath():
-        raise ValueError("material path must be an absolute USD prim path")
     rng = np.random.default_rng(seed)
     cache = UsdGeom.XformCache(time)
     positions = []
@@ -172,18 +207,25 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
     shading_enabled = center_darken > 0 or height_darken > 0
     up_axis = 2 if UsdGeom.GetStageUpAxis(stage) == UsdGeom.Tokens.z else 1
     materials_path = Path(materials_path or render_path.parent / 'materials.usda').resolve()
-    if shading_enabled:
-        material_stage = Usd.Stage.Open(str(materials_path)) if materials_path.is_file() else None
-        if not material_stage or not UsdShade.Material.Get(material_stage, material_path):
-            raise ValueError(f"cannot find material {material_path} in {materials_path}")
-        texture = UsdShade.Shader.Get(material_stage, Sdf.Path(material_path).AppendChild('BrushTexture'))
-        if not texture or texture.GetIdAttr().Get() != 'UsdUVTexture':
-            raise ValueError('shading requires a UsdUVTexture child named BrushTexture in the material')
-        scale_input = texture.GetInput('scale')
-        if scale_input and scale_input.HasConnectedSource():
-            raise ValueError('BrushTexture.inputs:scale must be an unconnected value for shading')
-        texture_scale = scale_input.Get() if scale_input else None
-        texture_scale = texture_scale if texture_scale is not None else Gf.Vec4f(1, 1, 1, 1)
+    selected = [material_path] if isinstance(material_path, str) else material_path
+    for p in selected or []:
+        if not Sdf.Path.IsValidPathString(p) or not Sdf.Path(p).IsAbsolutePath() or not Sdf.Path(p).IsPrimPath():
+            raise ValueError('material paths must be absolute USD prim paths')
+    material_stage = Usd.Stage.Open(str(materials_path)) if materials_path.is_file() else None
+    if selected is None:
+        if not material_stage:
+            raise ValueError(f'cannot open material stage: {materials_path}')
+        selected = [str(p.GetPath()) for p in material_stage.Traverse() if p.IsA(UsdShade.Material)]
+    selected = sorted(set(selected))
+    if not selected:
+        raise ValueError(f'no brush materials found in {materials_path}')
+    needs_variants = shading_enabled or opacity < 1 or len(selected) > 1
+    if needs_variants:
+        if not material_stage:
+            raise ValueError(f'cannot open material stage: {materials_path}')
+        brush_infos = [brush_info(material_stage, Sdf.Path(p)) for p in selected]
+    else:
+        brush_infos = []
     for mesh in meshes:
         local = sample_mesh(mesh, count, rng, time, max_attempts)
         transform = cache.GetLocalToWorldTransform(mesh.GetPrim())
@@ -204,6 +246,10 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
         qw = np.sqrt(u[:, 0]) * np.cos(2*math.pi*u[:, 2])
         orientations = [Gf.Quath(float(w), Gf.Vec3h(float(x), float(y), float(z))) for x,y,z,w in zip(qx,qy,qz,qw)]
     scales = rng.uniform(min_scale, max_scale, len(positions))
+    brush_rng = np.random.default_rng(np.random.SeedSequence([seed, 0x42525553]))
+    brush_indices = brush_rng.integers(0, len(selected), size=len(positions))
+    for i, path in enumerate(selected):
+        print(f'{path}: {int(np.count_nonzero(brush_indices == i))} cards')
 
     # Work in memory until everything is validated, then atomically replace the output.
     if render_path.exists():
@@ -234,14 +280,13 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
     material_relative = os.path.relpath(materials_path, render_path.parent).replace(os.sep, '/')
     if shading_enabled:
         bins = np.rint(np.clip(shade_values, 0, 1) * (shade_levels - 1)).astype(int)
-        used_bins = sorted(set(bins.tolist()))
     else:
-        bins = np.zeros(len(positions), dtype=int)
-        used_bins = [0]
+        bins = np.full(len(positions), shade_levels - 1, dtype=int)
+    used_pairs = sorted(set(zip(brush_indices.tolist(), bins.tolist())))
     prototype_paths = []
     variant_paths = []
-    for shade_bin in used_bins:
-        name = f'Card_{shade_bin:03d}' if shading_enabled else 'Card'
+    for brush_index, shade_bin in used_pairs:
+        name = f'Card_{brush_index:03d}_{shade_bin:03d}' if needs_variants else 'Card'
         proto = UsdGeom.Mesh.Define(output, '/ScatterCards/Prototypes/' + name)
         proto.CreatePointsAttr([(-half,-half,0), (half,-half,0), (half,half,0), (-half,half,0)])
         proto.CreateFaceVertexCountsAttr([4])
@@ -251,23 +296,31 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
         proto.CreateExtentAttr([(-half,-half,0), (half,half,0)])
         uv = UsdGeom.PrimvarsAPI(proto).CreatePrimvar('st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
         uv.Set([(0,0), (1,0), (1,1), (0,1)])
-        target = Sdf.Path(material_path)
-        if shading_enabled:
-            target = Sdf.Path(f'/ScatterCards/Materials/Shade_{shade_bin:03d}')
+        source_path = Sdf.Path(selected[brush_index])
+        target = source_path
+        if needs_variants:
+            target = Sdf.Path(f'/ScatterCards/Materials/Brush_{brush_index:03d}_Shade_{shade_bin:03d}')
             variant = UsdShade.Material.Define(output, target)
-            variant.GetPrim().GetReferences().AddReference(str(materials_path), Sdf.Path(material_path))
-            shader = UsdShade.Shader.Get(output, target.AppendChild('BrushTexture'))
+            variant.GetPrim().GetReferences().AddReference(str(materials_path), source_path)
+            texture_path, surface_path, texture_scale, texture_bias = brush_infos[brush_index]
+            shader = UsdShade.Shader.Get(output, target.AppendPath(texture_path))
             factor = shade_bin / (shade_levels - 1)
             shader.CreateInput('scale', Sdf.ValueTypeNames.Float4).Set(
-                Gf.Vec4f(*(float(texture_scale[i]) * factor for i in range(3)), float(texture_scale[3])))
-            variant_paths.append(target)
+                Gf.Vec4f(*(float(texture_scale[i]) * factor for i in range(3)), float(texture_scale[3]) * opacity))
+            shader.CreateInput('bias', Sdf.ValueTypeNames.Float4).Set(
+                Gf.Vec4f(*(float(texture_bias[i]) * factor for i in range(3)), float(texture_bias[3]) * opacity))
+            if opacity < 1:
+                surface = UsdShade.Shader.Get(output, target.AppendPath(surface_path))
+                surface.CreateInput('opacityThreshold', Sdf.ValueTypeNames.Float).Set(0)
+                surface.CreateInput('opacityMode', Sdf.ValueTypeNames.Token).Set('presence')
+            variant_paths.append((target, source_path))
         UsdShade.MaterialBindingAPI.Apply(proto.GetPrim())
         proto.GetPrim().CreateRelationship('material:binding').SetTargets([target])
         prototype_paths.append(proto.GetPath())
     inst.CreatePrototypesRel().SetTargets(prototype_paths)
     inst.CreatePositionsAttr(Vt.Vec3fArray([Gf.Vec3f(p) for p in positions]))
-    indices = {shade_bin: i for i, shade_bin in enumerate(used_bins)}
-    inst.CreateProtoIndicesAttr([indices[int(shade_bin)] for shade_bin in bins])
+    indices = {pair: i for i, pair in enumerate(used_pairs)}
+    inst.CreateProtoIndicesAttr([indices[(int(brush), int(shade))] for brush, shade in zip(brush_indices, bins)])
     inst.CreateOrientationsAttr(Vt.QuathArray(orientations))
     inst.CreateScalesAttr(Vt.Vec3fArray([Gf.Vec3f(float(s)) for s in scales]))
     # Conservative bound enclosing each rotated card at its largest radius.
@@ -275,12 +328,14 @@ def scatter(geo_path, render_path, count, seed, size, min_scale, max_scale,
     arr = np.asarray(positions)
     lo, hi = arr.min(axis=0) - radius, arr.max(axis=0) + radius
     inst.CreateExtentAttr([Gf.Vec3f(*lo), Gf.Vec3f(*hi)])
-    if shading_enabled:
+    if needs_variants:
         del shader, variant
+        if opacity < 1:
+            del surface
     del uv, proto, inst, output
     layer.subLayerPaths = authored_sublayers
-    for path in variant_paths:
-        layer.GetPrimAtPath(path).referenceList.explicitItems = [Sdf.Reference(material_relative, Sdf.Path(material_path))]
+    for path, source_path in variant_paths:
+        layer.GetPrimAtPath(path).referenceList.explicitItems = [Sdf.Reference(material_relative, source_path)]
     render_path.parent.mkdir(parents=True, exist_ok=True)
     import tempfile
     temp_path = None
@@ -308,8 +363,9 @@ def main():
     p.add_argument('--center-darken', type=float, default=0, help='center darkness 0..1 per mesh (default: 0)')
     p.add_argument('--height-darken', type=float, default=0, help='bottom darkness 0..1 per mesh, using stage up axis (default: 0)')
     p.add_argument('--shade-levels', type=int, default=32, help='number of discrete shading levels, 2..256 (default: 32)')
-    p.add_argument('--materials', default=None, help='material layer path for shading (default: materials.usda next to render)')
-    p.add_argument('--material', default='/Looks/CardMaterial', help='absolute material prim path in composed asset')
+    p.add_argument('--materials', default=None, help='brush material layer (default: materials.usda next to render)')
+    p.add_argument('--material', action='append', default=None, help='brush material prim path; repeat to select multiple (default: all materials)')
+    p.add_argument('--opacity', type=float, default=1.0, help='base opacity multiplier 0..1 (default: 1)')
     p.add_argument('--camera', default=None, help='USD camera file; orient card normals toward its camera position')
     p.add_argument('--camera-prim', default=None, help='absolute camera prim path (required if the camera file has multiple cameras)')
     p.add_argument('--time', type=float, default=None, help='sample geometry and transforms at this USD time code; default time otherwise')
@@ -318,7 +374,7 @@ def main():
     try:
         scatter(a.geo, a.render, a.count, a.seed, a.size, a.min_scale, a.max_scale,
                 a.material, Usd.TimeCode.Default() if a.time is None else Usd.TimeCode(a.time), a.max_attempts,
-                a.center_darken, a.height_darken, a.materials, a.shade_levels, a.camera, a.camera_prim)
+                a.center_darken, a.height_darken, a.materials, a.shade_levels, a.camera, a.camera_prim, a.opacity)
     except (ValueError, OSError, RuntimeError) as exc:
         p.exit(1, f'error: {exc}\n')
 

@@ -39,4 +39,20 @@ def Scope "Looks"
             token outputs:surface
         }
     }
+    # Additional example brushes inherit the same shader and use their own RGBA texture.
+    def Material "CardSweep" (prepend references = </Looks/CardMaterial>)
+    {
+        over "BrushTexture"
+        {
+            asset inputs:file = @./textures/brush_sweep.png@
+        }
+    }
+
+    def Material "CardDry" (prepend references = </Looks/CardMaterial>)
+    {
+        over "BrushTexture"
+        {
+            asset inputs:file = @./textures/brush_dry.png@
+        }
+    }
 }
